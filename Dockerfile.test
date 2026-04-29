@@ -1,19 +1,31 @@
-# Test runner for the gem on Linux. macOS silently no-ops setsockopt(TCP_USER_TIMEOUT)
-# via Errno::ENOPROTOOPT; the tests that observe kernel-level wedge resolution skip
-# unless RUBY_PLATFORM includes "linux", so we run them via a Linux container.
+# Linux test runner. TCP_USER_TIMEOUT is a Linux-only socket option, so
+# the kernel enforcement tests under test/linux and test/integration
+# can't be exercised on macOS or BSD — `setsockopt` returns ENOPROTOOPT
+# and the gem silently no-ops.
+#
+# Build:
+#   docker build -f Dockerfile.test -t tcp_user_timeout:linux .
+#
+# Run unit + middleware tests (cross-platform):
+#   docker run --rm -v $PWD:/app -w /app tcp_user_timeout:linux \
+#     bash -c "bundle install && bundle exec rake test"
+#
+# Run kernel enforcement tests (Linux-only):
+#   docker run --rm -v $PWD:/app -w /app tcp_user_timeout:linux \
+#     bash -c "bundle install && bundle exec rake test:linux"
+#
 FROM ruby:3.3-slim
 
-RUN apt-get update -qq \
-  && apt-get install -y --no-install-recommends \
-       build-essential \
-       git \
-       libyaml-dev \
-       pkg-config \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    libyaml-dev \
+    pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
-ENV BUNDLE_PATH=/bundle BUNDLE_DISABLE_SHARED_GEMS=true
-
 WORKDIR /app
-RUN git config --global --add safe.directory /app
+
+# Use a separate volume for bundle so re-runs don't reinstall dependencies
+ENV BUNDLE_PATH=/bundle BUNDLE_DISABLE_SHARED_GEMS=true
 
 CMD ["bash"]
