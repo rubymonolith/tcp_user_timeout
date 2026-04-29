@@ -65,11 +65,35 @@ To set expectations clearly:
 - **It does not retry.** When the kernel kills the connection, your code receives `Errno::ETIMEDOUT` (or one of the related exception classes — see [Catching the timeout](#catching-the-timeout-in-your-rescue-blocks)). Retry policy is yours.
 - **It does not work on macOS, BSD, or Windows.** No equivalent socket option exists. The gem silently no-ops on those platforms so dev workflows are unaffected, but production must run on Linux for the deadline to actually fire.
 
+## Production Linux Rails coverage
+
+Out-of-the-box coverage for a typical Rails-on-Linux production stack:
+
+| Layer | Tool | Mechanism |
+|-------|------|-----------|
+| Web server | Puma, Falcon, Passenger, Thin, Unicorn | Rack middleware bounds the request |
+| Job queue | Sidekiq | Server middleware (this gem) |
+| Job queue | SolidQueue | `require "tcp_user_timeout/solid_queue"` |
+| Job queue | GoodJob | ActiveJob concern |
+| Job queue | Resque, DelayedJob | Wrap `perform` with `with_timeout` |
+| HTTP client | `Net::HTTP`, `httpx`, Faraday (Net::HTTP/httpx adapters), Excon, RestClient | Socket-layer hook |
+| HTTP client | `curb` (libcurl) | **Not covered** — use libcurl's own timeouts |
+| Database | PostgreSQL via libpq | Native `tcp_user_timeout` connection param |
+| Database | MySQL via Trilogy (Rails 7.1+) | Socket-layer hook |
+| Database | MySQL via mysql2 | **Not covered** — use adapter `read_timeout` |
+| Database | MongoDB Ruby driver | Socket-layer hook |
+| Cache / store | Redis (`redis-rb`), Memcached (`dalli`) | Socket-layer hook |
+| Email | `Net::SMTP`, `Mail`, ActionMailer | Socket-layer hook |
+| RPC | gRPC (`grpc` gem) | **Not covered** — use gRPC `deadline:` |
+| WebSockets / SSE / pub/sub | Action Cable, Redis pub/sub | Use `exempt_hosts` to skip |
+
+If your stack is in the "Not covered" rows, either use that layer's own timeout primitive or rely on `global_default_seconds` as a coarse safety net for everything else.
+
 ## Compatibility
 
 | Requirement | Version |
 |-------------|---------|
-| Ruby | 3.0+ (3.2+ for `IO::TimeoutError` exception class) |
+| Ruby | 3.2+ (uses `Fiber[]` inheritable storage so child threads/fibers spawned inside `with_timeout` get the deadline) |
 | Linux kernel | 2.6.37+ (TCP_USER_TIMEOUT was added in 2010) |
 | Rails | 7.0+ (optional — only needed for the Railtie and ActiveJob concern) |
 | Sidekiq | any version with server-middleware support (optional) |
@@ -179,12 +203,12 @@ Bound every web request:
 config.middleware.use TcpUserTimeout::Middleware, timeout: 30
 ```
 
-Set the timeout below your web server's request kill threshold (Puma's `worker_timeout`, Falcon's deadline, NGINX's `proxy_read_timeout`) so the kernel-level kill happens before the supervisor takes the worker down. A common shape:
+Works with any Rack server: **Puma, Falcon, Passenger, Thin, Unicorn**. Set the timeout below your web server's request kill threshold (Puma's `worker_timeout`, Falcon's deadline, Passenger's `max_request_time`, NGINX's `proxy_read_timeout`) so the kernel-level kill happens before the supervisor takes the worker down. A common shape:
 
 | Layer                              | Bound        |
 |------------------------------------|--------------|
 | NGINX `proxy_read_timeout`         | 60s          |
-| Puma `worker_timeout`              | 60s          |
+| Puma `worker_timeout` (or Passenger `max_request_time`) | 60s |
 | `TcpUserTimeout::Middleware`       | 30s          |
 | Per-call `TcpUserTimeout.with_timeout` | 5–15s    |
 
@@ -427,6 +451,18 @@ The Ruby driver opens sockets via `TCPSocket.new`, so this gem covers them. The 
 ### Redis
 
 `redis-rb` uses Ruby sockets — covered. Set `connect_timeout`, `read_timeout`, `write_timeout` at client construction as a separate layer. Note that pub/sub subscribers (`subscribe`, `psubscribe`) hold connections idle for arbitrary durations — add those hosts to `exempt_hosts`.
+
+### Memcached (dalli)
+
+`dalli` opens TCP sockets via `TCPSocket.new` for non-Unix-socket connections — covered by the gem's hooks. The dalli client also supports `socket_timeout:` at construction (default 0.5s); both layers compose. Memcached connections are typically short and fast, so the kernel deadline rarely fires in practice but is there as the safety net.
+
+### SMTP (Net::SMTP / Mail / ActionMailer)
+
+`Net::SMTP` opens sockets via `TCPSocket.open` — covered. `Mail`'s SMTP delivery method goes through `Net::SMTP`, and `ActionMailer` uses `Mail` underneath, so the entire mail-delivery stack is covered. SMTP servers can stop responding mid-transaction (relay troubles, greylisting); the deadline catches that.
+
+### gRPC (FFI-based)
+
+The official `grpc` gem links libgrpc at the C level — its sockets are NOT visible to this gem's hooks. gRPC has its own deadline/timeout API (`deadline:` on every call); use it. The `grpc` proposal A18 documents kernel-level `TCP_USER_TIMEOUT` for gRPC at the C layer, but you have to enable it via channel args.
 
 ### Persistent connection pools
 
